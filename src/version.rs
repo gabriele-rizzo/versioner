@@ -1,21 +1,11 @@
 use regex::Regex;
-use serde::Deserialize;
-use std::{cmp::Ordering, fmt, sync::LazyLock};
+use std::{fmt, sync::LazyLock};
 
-use crate::{
-    cli::{Args, Commands},
-    error::VersionerError,
-    project::Project,
-};
+use crate::{cli::Commands, error::VersionerError};
 
 static SEMVER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)\.(\d+)\.(\d+)$").unwrap());
 
-#[derive(Deserialize)]
-pub(crate) struct Wrapper {
-    version: String,
-}
-
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Version {
     major: u32,
     minor: u32,
@@ -23,37 +13,41 @@ pub(crate) struct Version {
 }
 
 impl Version {
-    pub(crate) fn parse(package: &Project) -> Self {
-        let wrapper = serde_json::from_str::<Wrapper>(&package.json.to_string())
-            .unwrap_or_else(|_| VersionerError::InvalidVersion.fatal());
-
+    pub(crate) fn parse(version: &str) -> Self {
         let captures = SEMVER
-            .captures(&wrapper.version)
+            .captures(version)
             .unwrap_or_else(|| VersionerError::InvalidVersion.fatal());
 
+        let component = |index: usize| {
+            captures[index]
+                .parse()
+                .unwrap_or_else(|_| VersionerError::InvalidVersion.fatal())
+        };
+
         Self {
-            major: captures[1]
-                .parse()
-                .unwrap_or_else(|_| VersionerError::InvalidVersion.fatal()),
-            minor: captures[2]
-                .parse()
-                .unwrap_or_else(|_| VersionerError::InvalidVersion.fatal()),
-            patch: captures[3]
-                .parse()
-                .unwrap_or_else(|_| VersionerError::InvalidVersion.fatal()),
+            major: component(1),
+            minor: component(2),
+            patch: component(3),
         }
     }
 
-    pub(crate) fn bump(&self, args: &Args) -> Self {
-        let mut next = self.clone();
-
-        match args.command {
-            Commands::Major { message: _ } => next.major += 1,
-            Commands::Minor { message: _ } => next.minor += 1,
-            Commands::Patch { message: _ } => next.patch += 1,
+    pub(crate) fn bump(&self, command: &Commands) -> Self {
+        match command {
+            Commands::Major { .. } => Self {
+                major: self.major + 1,
+                minor: 0,
+                patch: 0,
+            },
+            Commands::Minor { .. } => Self {
+                minor: self.minor + 1,
+                patch: 0,
+                ..*self
+            },
+            Commands::Patch { .. } => Self {
+                patch: self.patch + 1,
+                ..*self
+            },
         }
-
-        next
     }
 }
 
@@ -63,13 +57,66 @@ impl fmt::Display for Version {
     }
 }
 
-impl PartialOrd for Version {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(
-            self.major
-                .cmp(&other.major)
-                .then(self.minor.cmp(&other.minor))
-                .then(self.patch.cmp(&other.patch)),
-        )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version(major: u32, minor: u32, patch: u32) -> Version {
+        Version {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    fn command(kind: &str) -> Commands {
+        let message = "chore: bump".to_owned();
+
+        match kind {
+            "major" => Commands::Major { message },
+            "minor" => Commands::Minor { message },
+            _ => Commands::Patch { message },
+        }
+    }
+
+    #[test]
+    fn parses_a_semver_string() {
+        assert_eq!(Version::parse("10.20.30"), version(10, 20, 30));
+        assert_eq!(Version::parse("0.0.0"), version(0, 0, 0));
+    }
+
+    #[test]
+    fn major_bump_resets_minor_and_patch() {
+        assert_eq!(version(1, 2, 3).bump(&command("major")), version(2, 0, 0));
+    }
+
+    #[test]
+    fn minor_bump_resets_patch_and_keeps_major() {
+        assert_eq!(version(1, 2, 3).bump(&command("minor")), version(1, 3, 0));
+    }
+
+    #[test]
+    fn patch_bump_keeps_major_and_minor() {
+        assert_eq!(version(1, 2, 3).bump(&command("patch")), version(1, 2, 4));
+    }
+
+    #[test]
+    fn a_bump_always_moves_forward() {
+        let current = version(1, 2, 3);
+
+        for kind in ["major", "minor", "patch"] {
+            assert!(current < current.bump(&command(kind)));
+        }
+    }
+
+    #[test]
+    fn orders_by_component_not_lexically() {
+        assert!(version(1, 2, 3) < version(1, 10, 0));
+        assert!(version(2, 0, 0) > version(1, 99, 99));
+    }
+
+    #[test]
+    fn displays_as_dotted_components() {
+        assert_eq!(version(1, 20, 3).to_string(), "1.20.3");
     }
 }

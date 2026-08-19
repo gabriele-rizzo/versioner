@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(author = "Gabriele Rizzo", long_about = None)]
+#[command(author = "Gabriele Rizzo", version, long_about = None)]
 pub(crate) struct Args {
     #[command(subcommand)]
     pub(crate) command: Commands,
@@ -15,11 +15,9 @@ pub(crate) enum Commands {
 }
 
 impl Commands {
-    pub(crate) fn message(&self) -> String {
+    pub(crate) fn message(&self) -> &str {
         match self {
-            Self::Major { message } => message.clone(),
-            Self::Minor { message } => message.clone(),
-            Self::Patch { message } => message.clone(),
+            Self::Major { message } | Self::Minor { message } | Self::Patch { message } => message,
         }
     }
 }
