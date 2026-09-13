@@ -14,7 +14,8 @@ impl VersionerError {
     pub(crate) fn fatal(&self) -> ! {
         let message = match self {
             Self::PackageNotFound => {
-                "package.json file not found in the current directory".to_owned()
+                "no package.json found between the current directory and the repository root"
+                    .to_owned()
             }
             Self::InvalidPackage => "invalid package.json file".to_owned(),
             Self::InvalidVersion => "invalid version format, expected: x.x.x".to_owned(),

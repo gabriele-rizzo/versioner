@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{path::PathBuf, process::Command};
 
 use crate::log;
 
@@ -38,6 +38,14 @@ impl Git {
         Git::succeeds(&["rev-parse", "--git-dir"])
     }
 
+    /// Top level of the worktree, or `None` outside a repository.
+    pub(crate) fn repository_root() -> Option<PathBuf> {
+        match Git::capture(&["rev-parse", "--show-toplevel"]) {
+            Ok(root) if !root.trim().is_empty() => Some(PathBuf::from(root.trim())),
+            _ => None,
+        }
+    }
+
     pub(crate) fn tag_exists(tag: &str) -> bool {
         Git::succeeds(&["rev-parse", "-q", "--verify", &format!("refs/tags/{tag}")])
     }
@@ -54,11 +62,12 @@ impl Git {
         }
     }
 
-    /// Changed paths other than package.json, which `git add -A` would sweep
-    /// into the version commit.
-    pub(crate) fn unrelated_changes() -> Vec<String> {
+    /// Changed paths other than the package.json being bumped, which
+    /// `git add -A` would sweep into the version commit. `bumped` is repo
+    /// relative, the same form `--porcelain` reports.
+    pub(crate) fn unrelated_changes(bumped: &str) -> Vec<String> {
         Git::capture(&["status", "--porcelain"])
-            .map(|status| unrelated_paths(&status))
+            .map(|status| unrelated_paths(&status, bumped))
             .unwrap_or_default()
     }
 
@@ -82,14 +91,15 @@ impl Git {
     }
 }
 
-/// Pulls the paths out of `git status --porcelain` output, dropping package.json.
-/// Each line is `XY <path>`, so the path starts at the fourth byte.
-fn unrelated_paths(status: &str) -> Vec<String> {
+/// Pulls the paths out of `git status --porcelain` output, dropping the one
+/// package.json being bumped. Each line is `XY <path>`, so the path starts at
+/// the fourth byte.
+fn unrelated_paths(status: &str, bumped: &str) -> Vec<String> {
     status
         .lines()
         .filter_map(|line| line.get(3..))
         .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"'))
-        .filter(|path| !path.ends_with("package.json") && !path.is_empty())
+        .filter(|path| *path != bumped && !path.is_empty())
         .map(str::to_owned)
         .collect()
 }
@@ -102,7 +112,10 @@ mod tests {
     fn keeps_the_first_path_intact() {
         let status = " M before.json\n M other.txt\n";
 
-        assert_eq!(unrelated_paths(status), ["before.json", "other.txt"]);
+        assert_eq!(
+            unrelated_paths(status, "package.json"),
+            ["before.json", "other.txt"]
+        );
     }
 
     #[test]
@@ -110,7 +123,7 @@ mod tests {
         let status = "?? new.txt\nM  staged.txt\nA  added.txt\nMM both.txt\n";
 
         assert_eq!(
-            unrelated_paths(status),
+            unrelated_paths(status, "package.json"),
             ["new.txt", "staged.txt", "added.txt", "both.txt"]
         );
     }
@@ -119,25 +132,32 @@ mod tests {
     fn reports_the_destination_of_a_rename() {
         let status = "R  old.txt -> new.txt\n";
 
-        assert_eq!(unrelated_paths(status), ["new.txt"]);
+        assert_eq!(unrelated_paths(status, "package.json"), ["new.txt"]);
     }
 
     #[test]
     fn unquotes_paths_with_special_characters() {
         let status = "?? \"sp ace.txt\"\n";
 
-        assert_eq!(unrelated_paths(status), ["sp ace.txt"]);
+        assert_eq!(unrelated_paths(status, "package.json"), ["sp ace.txt"]);
     }
 
     #[test]
-    fn drops_package_json_itself() {
-        let status = " M package.json\n M nested/package.json\n";
+    fn drops_only_the_package_json_being_bumped() {
+        let status = " M package.json\n M backend/package.json\n";
 
-        assert_eq!(unrelated_paths(status), [] as [String; 0]);
+        assert_eq!(
+            unrelated_paths(status, "backend/package.json"),
+            ["package.json"]
+        );
+        assert_eq!(
+            unrelated_paths(status, "package.json"),
+            ["backend/package.json"]
+        );
     }
 
     #[test]
     fn a_clean_tree_has_no_paths() {
-        assert_eq!(unrelated_paths(""), [] as [String; 0]);
+        assert_eq!(unrelated_paths("", "package.json"), [] as [String; 0]);
     }
 }

@@ -1,4 +1,7 @@
-use std::{ops::Range, path::PathBuf};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use crate::{cli::Args, error::VersionerError, git::Git, log, version::Version};
 use serde_json::Value;
@@ -7,6 +10,11 @@ pub(crate) struct Project {
     path: PathBuf,
     source: String,
     version: Range<usize>,
+    /// Tag namespace for a workspace package; `None` at the repository root,
+    /// which keeps the bare `vX.Y.Z` tags.
+    scope: Option<String>,
+    /// Repo relative path, for logs and for matching `git status` output.
+    label: String,
 }
 
 impl Project {
@@ -15,11 +23,11 @@ impl Project {
             VersionerError::PackageNotFound.fatal()
         };
 
-        let path = cwd.join("package.json");
+        let cwd = canonical(&cwd);
+        let root = Git::repository_root().map(|root| canonical(&root));
 
-        if !path.exists() {
-            VersionerError::PackageNotFound.fatal()
-        }
+        let path = locate(&cwd, root.as_deref())
+            .unwrap_or_else(|| VersionerError::PackageNotFound.fatal());
 
         if !path.is_file() {
             VersionerError::InvalidPackage.fatal()
@@ -29,17 +37,40 @@ impl Project {
             VersionerError::InvalidPackage.fatal()
         };
 
-        if serde_json::from_str::<Value>(&source).is_err() {
+        let Ok(document) = serde_json::from_str::<Value>(&source) else {
             VersionerError::InvalidPackage.fatal()
-        }
+        };
 
         let version =
             version_span(&source).unwrap_or_else(|| VersionerError::InvalidVersion.fatal());
+
+        let at_root = root
+            .as_deref()
+            .is_some_and(|root| path.parent() == Some(root));
+        let scope = (!at_root).then(|| tag_scope(&document, &path));
+
+        let label = root
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path.as_path())
+            .display()
+            .to_string();
 
         Self {
             path,
             source,
             version,
+            scope,
+            label,
+        }
+    }
+
+    /// `v1.2.3` for the repository root, `backend-v1.2.3` for a workspace
+    /// package, so sibling packages can't collide on one tag.
+    fn tag(&self, version: &Version) -> String {
+        match &self.scope {
+            Some(scope) => format!("{scope}-v{version}"),
+            None => format!("v{version}"),
         }
     }
 
@@ -58,11 +89,9 @@ impl Project {
             VersionerError::SaveFailed.fatal();
         }
 
-        if current < next {
-            log::info(&format!("{} → {}", current, next));
-        } else {
-            log::info(&format!("{} ← {}", current, next));
-        }
+        let arrow = if current < next { "→" } else { "←" };
+
+        log::info(&format!("{}: {current} {arrow} {next}", self.label));
     }
 
     pub(crate) fn update(&mut self, args: Args) {
@@ -72,7 +101,7 @@ impl Project {
 
         let current = Version::parse(self.version());
         let next = current.bump(&args.command);
-        let tag = format!("v{next}");
+        let tag = self.tag(&next);
 
         if Git::tag_exists(&tag) {
             VersionerError::TagExists(tag).fatal()
@@ -80,7 +109,7 @@ impl Project {
 
         let branch = Git::current_branch();
 
-        warn_about_unrelated_changes();
+        warn_about_unrelated_changes(&self.label);
 
         self.save(&current, &next);
 
@@ -112,8 +141,8 @@ impl Project {
 }
 
 /// `Git::commit` stages the whole worktree, so say what else is coming along.
-fn warn_about_unrelated_changes() {
-    let changes = Git::unrelated_changes();
+fn warn_about_unrelated_changes(bumped: &str) {
+    let changes = Git::unrelated_changes(bumped);
 
     let Some((first, rest)) = changes.split_first() else {
         return;
@@ -126,6 +155,75 @@ fn warn_about_unrelated_changes() {
     };
 
     log::warn(&format!("this commit will also include {listed}"));
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Nearest package.json at or above `from`, never climbing past the repository
+/// root so a bump can't reach a package outside the repo it tags. Without a
+/// repository there is nothing to bound the walk, and `Project::update` rejects
+/// that case anyway, so only `from` itself is considered.
+fn locate(from: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    let Some(root) = root else {
+        return Some(from.join("package.json")).filter(|path| path.exists());
+    };
+
+    for directory in from.ancestors() {
+        let candidate = directory.join("package.json");
+
+        if candidate.exists() {
+            return Some(candidate);
+        }
+
+        if directory == root {
+            break;
+        }
+    }
+
+    None
+}
+
+/// Git-ref-safe tag namespace for a workspace package: the unscoped half of its
+/// `"name"`, falling back to the directory it lives in.
+fn tag_scope(document: &Value, path: &Path) -> String {
+    let name = document
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let name = slugify(name.rsplit('/').next().unwrap_or_default());
+
+    if !name.is_empty() {
+        return name;
+    }
+
+    let directory = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|directory| directory.to_str())
+        .unwrap_or_default();
+
+    match slugify(directory) {
+        directory if directory.is_empty() => "package".to_owned(),
+        directory => directory,
+    }
+}
+
+/// Keeps only what `git check-ref-format` is happy with, and drops the `.lock`
+/// suffix and leading punctuation git rejects outright.
+fn slugify(name: &str) -> String {
+    let kept: String = name
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => character,
+            _ => '-',
+        })
+        .collect();
+
+    let trimmed = kept.trim_matches(['.', '-']);
+
+    trimmed.strip_suffix(".lock").unwrap_or(trimmed).to_owned()
 }
 
 /// Byte range of the top-level `"version"` string value inside a JSON document.
@@ -200,7 +298,132 @@ fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::version_span;
+    use super::{locate, slugify, tag_scope, version_span};
+    use serde_json::json;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU32, Ordering},
+    };
+
+    /// A throwaway `root/backend/src` tree with package.json files wherever
+    /// `packages` says, mirroring a workspace layout.
+    struct Tree {
+        root: PathBuf,
+    }
+
+    impl Tree {
+        fn new(packages: &[&str]) -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root =
+                std::env::temp_dir().join(format!("versioner-{}-{unique}", std::process::id()));
+
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("backend/src")).unwrap();
+
+            for package in packages {
+                fs::write(root.join(package).join("package.json"), "{}").unwrap();
+            }
+
+            Self {
+                root: fs::canonicalize(&root).unwrap(),
+            }
+        }
+
+        fn at(&self, relative: &str) -> PathBuf {
+            self.root.join(relative)
+        }
+
+        fn found(&self, from: &str) -> Option<String> {
+            locate(&self.at(from), Some(&self.root)).map(|path| {
+                path.strip_prefix(&self.root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string()
+            })
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn finds_the_package_json_in_the_current_directory() {
+        let tree = Tree::new(&[".", "backend"]);
+
+        assert_eq!(tree.found("."), Some("package.json".to_owned()));
+        assert_eq!(
+            tree.found("backend"),
+            Some("backend/package.json".to_owned())
+        );
+    }
+
+    #[test]
+    fn walks_up_to_the_nearest_package_json() {
+        let tree = Tree::new(&[".", "backend"]);
+
+        assert_eq!(
+            tree.found("backend/src"),
+            Some("backend/package.json".to_owned())
+        );
+    }
+
+    #[test]
+    fn walks_past_directories_without_a_package_json() {
+        let tree = Tree::new(&["."]);
+
+        assert_eq!(tree.found("backend/src"), Some("package.json".to_owned()));
+    }
+
+    #[test]
+    fn never_climbs_past_the_repository_root() {
+        let tree = Tree::new(&[]);
+
+        assert_eq!(tree.found("backend/src"), None);
+        assert_eq!(tree.found("."), None);
+    }
+
+    #[test]
+    fn outside_a_repository_only_the_current_directory_counts() {
+        let tree = Tree::new(&["."]);
+
+        assert_eq!(locate(&tree.at("."), None), Some(tree.at("package.json")));
+        assert_eq!(locate(&tree.at("backend/src"), None), None);
+    }
+
+    #[test]
+    fn scopes_a_tag_by_the_unscoped_package_name() {
+        let path = Path::new("/repo/backend/package.json");
+
+        assert_eq!(
+            tag_scope(&json!({"name": "@airisk/backend"}), path),
+            "backend"
+        );
+        assert_eq!(tag_scope(&json!({"name": "backend"}), path), "backend");
+    }
+
+    #[test]
+    fn falls_back_to_the_directory_without_a_usable_name() {
+        let path = Path::new("/repo/backend/package.json");
+
+        assert_eq!(tag_scope(&json!({}), path), "backend");
+        assert_eq!(tag_scope(&json!({"name": "@scope/"}), path), "backend");
+        assert_eq!(tag_scope(&json!({"name": 3}), path), "backend");
+    }
+
+    #[test]
+    fn keeps_slugs_valid_as_git_refs() {
+        assert_eq!(slugify("web app"), "web-app");
+        assert_eq!(slugify("a:b^c~d?e*f[g"), "a-b-c-d-e-f-g");
+        assert_eq!(slugify("--lead.."), "lead");
+        assert_eq!(slugify("cache.lock"), "cache");
+        assert_eq!(slugify("..."), "");
+    }
 
     fn version_of(source: &str) -> Option<&str> {
         version_span(source).map(|span| &source[span])
