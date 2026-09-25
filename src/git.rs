@@ -4,6 +4,14 @@ use crate::log;
 
 pub(crate) struct Git;
 
+/// Where HEAD and the index stood before a release touched them.
+pub(crate) struct Snapshot {
+    /// `None` on a branch with no commits yet.
+    head: Option<String>,
+    /// Tree object holding the index exactly as it was, staged changes included.
+    index: String,
+}
+
 impl Git {
     /// Runs a git command and returns its stdout verbatim. `Err` carries git's
     /// own diagnostics, whether it failed to spawn or exited non-zero.
@@ -62,18 +70,70 @@ impl Git {
         }
     }
 
-    /// Changed paths other than the package.json being bumped, which
-    /// `git add -A` would sweep into the version commit. `bumped` is repo
-    /// relative, the same form `--porcelain` reports.
-    pub(crate) fn unrelated_changes(bumped: &str) -> Vec<String> {
-        Git::capture(&["status", "--porcelain"])
-            .map(|status| unrelated_paths(&status, bumped))
+    fn head() -> Option<String> {
+        Git::capture(&["rev-parse", "-q", "--verify", "HEAD"])
+            .ok()
+            .map(|head| head.trim().to_owned())
+    }
+
+    /// Every changed path in the worktree, repo relative, untracked files
+    /// listed one by one rather than collapsed into their directory.
+    pub(crate) fn changed_paths() -> Vec<String> {
+        Git::capture(&["status", "--porcelain", "-z", "--untracked-files=all"])
+            .map(|status| changed_paths(&status))
             .unwrap_or_default()
     }
 
-    pub(crate) fn commit(message: &str, tag: &str) -> Result<(), String> {
-        Git::run(&["add", "-A"])?;
-        Git::run(&["commit", "-m", message])?;
+    /// Fails during an unresolved merge, which is no time to cut a release.
+    pub(crate) fn snapshot() -> Result<Snapshot, String> {
+        Ok(Snapshot {
+            head: Git::head(),
+            index: Git::capture(&["write-tree"])?.trim().to_owned(),
+        })
+    }
+
+    /// Moves HEAD back to where `snapshot` found it (only if a commit was made
+    /// on top) and reloads the index it saved.
+    pub(crate) fn restore(snapshot: &Snapshot) -> Result<(), String> {
+        let current = Git::head();
+
+        if let Some(commit) = current.as_deref().filter(|_| current != snapshot.head) {
+            match &snapshot.head {
+                Some(head) => Git::run(&[
+                    "update-ref",
+                    "-m",
+                    "versioner: roll back failed release",
+                    "HEAD",
+                    head,
+                    commit,
+                ])?,
+                // First commit on the branch: back to an unborn branch.
+                None => Git::run(&["update-ref", "-d", "HEAD", commit])?,
+            }
+        }
+
+        Git::run(&["read-tree", &snapshot.index])
+    }
+
+    /// Commits `paths` (repo relative) and nothing else, leaving whatever else
+    /// is staged still staged. With `all`, commits the whole worktree.
+    pub(crate) fn commit(message: &str, paths: &[&str], all: bool) -> Result<(), String> {
+        if all {
+            Git::run(&["add", "-A"])?;
+            return Git::run(&["commit", "-m", message]);
+        }
+
+        let specs: Vec<String> = paths
+            .iter()
+            .map(|path| format!(":(top,literal){path}"))
+            .collect();
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+
+        Git::run(&[&["add", "--"], specs.as_slice()].concat())?;
+        Git::run(&[&["commit", "-m", message, "--only", "--"], specs.as_slice()].concat())
+    }
+
+    pub(crate) fn tag(tag: &str, message: &str) -> Result<(), String> {
         Git::run(&["tag", "-a", tag, "-m", message])?;
 
         log::info(&format!("successfully committed '{tag}'"));
@@ -81,9 +141,18 @@ impl Git {
         Ok(())
     }
 
+    /// Pushes the branch and the tag together, so the remote never ends up with
+    /// one and not the other. Falls back to a plain push for servers that don't
+    /// support `--atomic`.
     pub(crate) fn push(branch: &str, tag: &str) -> Result<(), String> {
-        Git::run(&["push", "-u", "origin", branch])?;
-        Git::run(&["push", "origin", tag])?;
+        let tag_ref = format!("refs/tags/{tag}");
+
+        match Git::run(&["push", "--atomic", "-u", "origin", branch, &tag_ref]) {
+            Err(reason) if reason.contains("does not support --atomic") => {
+                Git::run(&["push", "-u", "origin", branch, &tag_ref])?;
+            }
+            other => other?,
+        }
 
         log::info(&format!("pushed {branch} and '{tag}' to origin"));
 
@@ -91,73 +160,64 @@ impl Git {
     }
 }
 
-/// Pulls the paths out of `git status --porcelain` output, dropping the one
-/// package.json being bumped. Each line is `XY <path>`, so the path starts at
-/// the fourth byte.
-fn unrelated_paths(status: &str, bumped: &str) -> Vec<String> {
-    status
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"'))
-        .filter(|path| *path != bumped && !path.is_empty())
-        .map(str::to_owned)
-        .collect()
+/// Paths out of `git status --porcelain -z`: NUL-separated `XY <path>` records,
+/// where a rename or copy is followed by one extra record holding its source.
+fn changed_paths(status: &str) -> Vec<String> {
+    let mut records = status.split('\0');
+    let mut paths = Vec::new();
+
+    while let Some(record) = records.next() {
+        let Some(path) = record.get(3..).filter(|path| !path.is_empty()) else {
+            continue;
+        };
+
+        if matches!(record.as_bytes().first(), Some(b'R' | b'C')) {
+            records.next();
+        }
+
+        paths.push(path.to_owned());
+    }
+
+    paths
 }
 
 #[cfg(test)]
 mod tests {
-    use super::unrelated_paths;
+    use super::changed_paths;
 
     #[test]
     fn keeps_the_first_path_intact() {
-        let status = " M before.json\n M other.txt\n";
+        let status = " M before.json\0 M other.txt\0";
 
-        assert_eq!(
-            unrelated_paths(status, "package.json"),
-            ["before.json", "other.txt"]
-        );
+        assert_eq!(changed_paths(status), ["before.json", "other.txt"]);
     }
 
     #[test]
     fn reads_every_status_code_column() {
-        let status = "?? new.txt\nM  staged.txt\nA  added.txt\nMM both.txt\n";
+        let status = "?? new.txt\0M  staged.txt\0A  added.txt\0MM both.txt\0";
 
         assert_eq!(
-            unrelated_paths(status, "package.json"),
+            changed_paths(status),
             ["new.txt", "staged.txt", "added.txt", "both.txt"]
         );
     }
 
     #[test]
     fn reports_the_destination_of_a_rename() {
-        let status = "R  old.txt -> new.txt\n";
+        let status = "R  new.txt\0old.txt\0 M after.txt\0";
 
-        assert_eq!(unrelated_paths(status, "package.json"), ["new.txt"]);
+        assert_eq!(changed_paths(status), ["new.txt", "after.txt"]);
     }
 
     #[test]
-    fn unquotes_paths_with_special_characters() {
-        let status = "?? \"sp ace.txt\"\n";
+    fn keeps_special_characters_verbatim() {
+        let status = "?? sp ace \"q\".txt\0";
 
-        assert_eq!(unrelated_paths(status, "package.json"), ["sp ace.txt"]);
-    }
-
-    #[test]
-    fn drops_only_the_package_json_being_bumped() {
-        let status = " M package.json\n M backend/package.json\n";
-
-        assert_eq!(
-            unrelated_paths(status, "backend/package.json"),
-            ["package.json"]
-        );
-        assert_eq!(
-            unrelated_paths(status, "package.json"),
-            ["backend/package.json"]
-        );
+        assert_eq!(changed_paths(status), ["sp ace \"q\".txt"]);
     }
 
     #[test]
     fn a_clean_tree_has_no_paths() {
-        assert_eq!(unrelated_paths("", "package.json"), [] as [String; 0]);
+        assert_eq!(changed_paths(""), [] as [String; 0]);
     }
 }

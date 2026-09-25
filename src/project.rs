@@ -1,198 +1,162 @@
-use std::{
-    ops::Range,
-    path::{Path, PathBuf},
+use std::path::{Path, PathBuf};
+
+use crate::{
+    edit::{Edit, label},
+    error::VersionerError,
+    git::Git,
+    lockfile,
+    manifest::{Format, Manifest},
+    version::Version,
 };
 
-use crate::{cli::Args, error::VersionerError, git::Git, log, version::Version};
-use serde_json::Value;
-
 pub(crate) struct Project {
-    path: PathBuf,
-    source: String,
-    version: Range<usize>,
+    pub(crate) manifest: Manifest,
+    root: PathBuf,
     /// Tag namespace for a workspace package; `None` at the repository root,
     /// which keeps the bare `vX.Y.Z` tags.
     scope: Option<String>,
-    /// Repo relative path, for logs and for matching `git status` output.
-    label: String,
 }
 
 impl Project {
-    pub(crate) fn parse() -> Project {
-        let Ok(cwd) = std::env::current_dir() else {
-            VersionerError::PackageNotFound.fatal()
+    /// The manifest at `explicit`, or else the nearest one at or above the
+    /// current directory.
+    pub(crate) fn locate(explicit: Option<&Path>) -> Result<Self, VersionerError> {
+        let root = Git::repository_root()
+            .map(|root| canonical(&root))
+            .ok_or(VersionerError::NotARepository)?;
+
+        let manifest = match explicit {
+            Some(path) => {
+                let path = canonical(path);
+
+                if !path.starts_with(&root) {
+                    return Err(VersionerError::OutsideRepository(
+                        path.display().to_string(),
+                    ));
+                }
+
+                Manifest::read(&path, &label(&root, &path))?
+            }
+            None => {
+                let cwd = std::env::current_dir().map_err(|_| VersionerError::ManifestNotFound)?;
+
+                find(&canonical(&cwd), &root)?
+            }
         };
 
-        let cwd = canonical(&cwd);
-        let root = Git::repository_root().map(|root| canonical(&root));
+        let at_root = manifest.path.parent() == Some(root.as_path());
+        let scope = (!at_root).then(|| tag_scope(manifest.name.as_deref(), &manifest.path));
 
-        let path = locate(&cwd, root.as_deref())
-            .unwrap_or_else(|| VersionerError::PackageNotFound.fatal());
-
-        if !path.is_file() {
-            VersionerError::InvalidPackage.fatal()
-        }
-
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            VersionerError::InvalidPackage.fatal()
-        };
-
-        let Ok(document) = serde_json::from_str::<Value>(&source) else {
-            VersionerError::InvalidPackage.fatal()
-        };
-
-        let version =
-            version_span(&source).unwrap_or_else(|| VersionerError::InvalidVersion.fatal());
-
-        let at_root = root
-            .as_deref()
-            .is_some_and(|root| path.parent() == Some(root));
-        let scope = (!at_root).then(|| tag_scope(&document, &path));
-
-        let label = root
-            .as_deref()
-            .and_then(|root| path.strip_prefix(root).ok())
-            .unwrap_or(path.as_path())
-            .display()
-            .to_string();
-
-        Self {
-            path,
-            source,
-            version,
+        Ok(Self {
+            manifest,
+            root,
             scope,
-            label,
-        }
+        })
     }
 
     /// `v1.2.3` for the repository root, `backend-v1.2.3` for a workspace
     /// package, so sibling packages can't collide on one tag.
-    fn tag(&self, version: &Version) -> String {
+    pub(crate) fn tag(&self, version: &Version) -> String {
         match &self.scope {
             Some(scope) => format!("{scope}-v{version}"),
             None => format!("v{version}"),
         }
     }
 
-    pub(crate) fn version(&self) -> &str {
-        &self.source[self.version.clone()]
+    /// The manifest and lockfile rewrites for `next`, all verified up front so
+    /// nothing is written unless every file can be edited cleanly.
+    pub(crate) fn edits(&self, next: &Version) -> Result<Vec<Edit>, VersionerError> {
+        let next = next.to_string();
+
+        let mut edits = vec![Edit {
+            path: self.manifest.path.clone(),
+            label: self.manifest.label.clone(),
+            from: self.manifest.version().to_owned(),
+            original: self.manifest.source.clone(),
+            updated: self.manifest.rewritten(&next)?,
+        }];
+
+        edits.extend(lockfile::edits(&self.manifest, &self.root, &next)?);
+
+        Ok(edits)
     }
-
-    /// Rewrites only the version value, leaving the rest of the file byte-for-byte intact.
-    fn save(&mut self, current: &Version, next: &Version) {
-        let value = next.to_string();
-
-        self.source.replace_range(self.version.clone(), &value);
-        self.version = self.version.start..self.version.start + value.len();
-
-        if std::fs::write(&self.path, &self.source).is_err() {
-            VersionerError::SaveFailed.fatal();
-        }
-
-        let arrow = if current < next { "→" } else { "←" };
-
-        log::info(&format!("{}: {current} {arrow} {next}", self.label));
-    }
-
-    pub(crate) fn update(&mut self, args: Args) {
-        if !Git::is_repository() {
-            VersionerError::NotARepository.fatal()
-        }
-
-        let current = Version::parse(self.version());
-        let next = current.bump(&args.command);
-        let tag = self.tag(&next);
-
-        if Git::tag_exists(&tag) {
-            VersionerError::TagExists(tag).fatal()
-        }
-
-        let branch = Git::current_branch();
-
-        warn_about_unrelated_changes(&self.label);
-
-        self.save(&current, &next);
-
-        if let Err(reason) = Git::commit(args.command.message(), &tag) {
-            self.save(&next, &current);
-            VersionerError::CommitFailed(reason).fatal()
-        }
-
-        let hint = match &branch {
-            Some(branch) => {
-                format!("push with: 'git push -u origin {branch} && git push origin {tag}'")
-            }
-            None => format!("push with: 'git push origin {tag}'"),
-        };
-
-        if !Git::has_origin_remote() {
-            return log::info(&format!("no 'origin' remote configured, {hint}"));
-        }
-
-        let Some(branch) = branch else {
-            return log::warn(&format!("detached HEAD, nothing to push to, {hint}"));
-        };
-
-        if let Err(reason) = Git::push(&branch, &tag) {
-            log::warn(&reason);
-            log::info(&format!("changes exist locally, {hint}"));
-        }
-    }
-}
-
-/// `Git::commit` stages the whole worktree, so say what else is coming along.
-fn warn_about_unrelated_changes(bumped: &str) {
-    let changes = Git::unrelated_changes(bumped);
-
-    let Some((first, rest)) = changes.split_first() else {
-        return;
-    };
-
-    let listed = match rest.len() {
-        0 => first.to_owned(),
-        1 => format!("{first} and {}", rest[0]),
-        count => format!("{first} and {count} other files"),
-    };
-
-    log::warn(&format!("this commit will also include {listed}"));
 }
 
 fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Nearest package.json at or above `from`, never climbing past the repository
-/// root so a bump can't reach a package outside the repo it tags. Without a
-/// repository there is nothing to bound the walk, and `Project::update` rejects
-/// that case anyway, so only `from` itself is considered.
-fn locate(from: &Path, root: Option<&Path>) -> Option<PathBuf> {
-    let Some(root) = root else {
-        return Some(from.join("package.json")).filter(|path| path.exists());
-    };
-
+/// Nearest directory at or above `from` holding a manifest, never climbing
+/// past the repository root so a bump can't reach a package outside the repo
+/// it tags.
+fn find(from: &Path, root: &Path) -> Result<Manifest, VersionerError> {
     for directory in from.ancestors() {
-        let candidate = directory.join("package.json");
-
-        if candidate.exists() {
-            return Some(candidate);
+        if !directory.starts_with(root) {
+            break;
         }
 
-        if directory == root {
-            break;
+        let candidates: Vec<PathBuf> = Format::ALL
+            .iter()
+            .map(|format| directory.join(format.file_name()))
+            .filter(|path| path.is_file())
+            .collect();
+
+        if !candidates.is_empty() {
+            return choose(root, candidates);
         }
     }
 
-    None
+    Err(VersionerError::ManifestNotFound)
+}
+
+/// With several manifests side by side, the one that carries a version wins:
+/// a package.json that only holds tooling shouldn't shadow a Cargo.toml.
+fn choose(root: &Path, candidates: Vec<PathBuf>) -> Result<Manifest, VersionerError> {
+    let mut read: Vec<Result<Manifest, VersionerError>> = candidates
+        .iter()
+        .map(|path| Manifest::read(path, &label(root, path)))
+        .collect();
+
+    if read.len() == 1 {
+        return read.remove(0);
+    }
+
+    let (versioned, failed): (Vec<_>, Vec<_>) = read.into_iter().partition(Result::is_ok);
+    let mut versioned: Vec<Manifest> = versioned.into_iter().filter_map(Result::ok).collect();
+
+    match versioned.len() {
+        1 => Ok(versioned.remove(0)),
+        0 => {
+            let mut errors: Vec<VersionerError> =
+                failed.into_iter().filter_map(Result::err).collect();
+
+            // "has no version" is the least useful thing to report when another
+            // manifest failed for a real reason.
+            let position = errors
+                .iter()
+                .position(|error| !matches!(error, VersionerError::MissingVersion(_)))
+                .unwrap_or(0);
+
+            Err(errors.swap_remove(position))
+        }
+        _ => Err(VersionerError::AmbiguousManifest(
+            versioned
+                .into_iter()
+                .map(|manifest| manifest.label)
+                .collect(),
+        )),
+    }
 }
 
 /// Git-ref-safe tag namespace for a workspace package: the unscoped half of its
-/// `"name"`, falling back to the directory it lives in.
-fn tag_scope(document: &Value, path: &Path) -> String {
-    let name = document
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let name = slugify(name.rsplit('/').next().unwrap_or_default());
+/// name, falling back to the directory it lives in.
+fn tag_scope(name: Option<&str>, path: &Path) -> String {
+    let name = slugify(
+        name.unwrap_or_default()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default(),
+    );
 
     if !name.is_empty() {
         return name;
@@ -226,94 +190,24 @@ fn slugify(name: &str) -> String {
     trimmed.strip_suffix(".lock").unwrap_or(trimmed).to_owned()
 }
 
-/// Byte range of the top-level `"version"` string value inside a JSON document.
-fn version_span(source: &str) -> Option<Range<usize>> {
-    let bytes = source.as_bytes();
-    let mut depth = 0usize;
-    let mut cursor = 0usize;
-
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            b'{' | b'[' => {
-                depth += 1;
-                cursor += 1;
-            }
-            b'}' | b']' => {
-                depth = depth.saturating_sub(1);
-                cursor += 1;
-            }
-            b'"' => {
-                let (key, after) = string_span(bytes, cursor)?;
-                cursor = after;
-
-                if depth != 1 || &source[key] != "version" {
-                    continue;
-                }
-
-                let colon = skip_whitespace(bytes, cursor);
-
-                if bytes.get(colon) != Some(&b':') {
-                    continue;
-                }
-
-                let value = skip_whitespace(bytes, colon + 1);
-
-                if bytes.get(value) != Some(&b'"') {
-                    return None;
-                }
-
-                return string_span(bytes, value).map(|(span, _)| span);
-            }
-            _ => cursor += 1,
-        }
-    }
-
-    None
-}
-
-/// Span of a string's contents plus the index just past its closing quote.
-fn string_span(bytes: &[u8], quote: usize) -> Option<(Range<usize>, usize)> {
-    let mut cursor = quote + 1;
-
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            b'\\' => cursor += 2,
-            b'"' => return Some((quote + 1..cursor, cursor + 1)),
-            _ => cursor += 1,
-        }
-    }
-
-    None
-}
-
-fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
-    let mut cursor = from;
-
-    while matches!(bytes.get(cursor), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-        cursor += 1;
-    }
-
-    cursor
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{locate, slugify, tag_scope, version_span};
-    use serde_json::json;
+    use super::{find, slugify, tag_scope};
+    use crate::error::VersionerError;
     use std::{
         fs,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU32, Ordering},
     };
 
-    /// A throwaway `root/backend/src` tree with package.json files wherever
-    /// `packages` says, mirroring a workspace layout.
+    /// A throwaway `root/backend/src` tree with manifests wherever `files`
+    /// says, mirroring a workspace layout.
     struct Tree {
         root: PathBuf,
     }
 
     impl Tree {
-        fn new(packages: &[&str]) -> Self {
+        fn new(files: &[(&str, &str)]) -> Self {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
 
             let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -323,8 +217,8 @@ mod tests {
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(root.join("backend/src")).unwrap();
 
-            for package in packages {
-                fs::write(root.join(package).join("package.json"), "{}").unwrap();
+            for (path, contents) in files {
+                fs::write(root.join(path), contents).unwrap();
             }
 
             Self {
@@ -332,17 +226,8 @@ mod tests {
             }
         }
 
-        fn at(&self, relative: &str) -> PathBuf {
-            self.root.join(relative)
-        }
-
-        fn found(&self, from: &str) -> Option<String> {
-            locate(&self.at(from), Some(&self.root)).map(|path| {
-                path.strip_prefix(&self.root)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string()
-            })
+        fn found(&self, from: &str) -> Result<String, VersionerError> {
+            find(&self.root.join(from), &self.root).map(|manifest| manifest.label)
         }
     }
 
@@ -352,68 +237,87 @@ mod tests {
         }
     }
 
-    #[test]
-    fn finds_the_package_json_in_the_current_directory() {
-        let tree = Tree::new(&[".", "backend"]);
+    const NPM: &str = r#"{"version": "1.0.0"}"#;
+    const CARGO: &str = "[package]\nname = \"core\"\nversion = \"1.0.0\"\n";
 
-        assert_eq!(tree.found("."), Some("package.json".to_owned()));
-        assert_eq!(
-            tree.found("backend"),
-            Some("backend/package.json".to_owned())
-        );
+    #[test]
+    fn finds_the_manifest_in_the_current_directory() {
+        let tree = Tree::new(&[("package.json", NPM), ("backend/package.json", NPM)]);
+
+        assert_eq!(tree.found(".").unwrap(), "package.json");
+        assert_eq!(tree.found("backend").unwrap(), "backend/package.json");
     }
 
     #[test]
-    fn walks_up_to_the_nearest_package_json() {
-        let tree = Tree::new(&[".", "backend"]);
+    fn walks_up_to_the_nearest_manifest() {
+        let tree = Tree::new(&[("package.json", NPM), ("backend/Cargo.toml", CARGO)]);
 
-        assert_eq!(
-            tree.found("backend/src"),
-            Some("backend/package.json".to_owned())
-        );
+        assert_eq!(tree.found("backend/src").unwrap(), "backend/Cargo.toml");
     }
 
     #[test]
-    fn walks_past_directories_without_a_package_json() {
-        let tree = Tree::new(&["."]);
+    fn walks_past_directories_without_a_manifest() {
+        let tree = Tree::new(&[("pyproject.toml", "[project]\nversion = \"1.0.0\"\n")]);
 
-        assert_eq!(tree.found("backend/src"), Some("package.json".to_owned()));
+        assert_eq!(tree.found("backend/src").unwrap(), "pyproject.toml");
     }
 
     #[test]
     fn never_climbs_past_the_repository_root() {
         let tree = Tree::new(&[]);
 
-        assert_eq!(tree.found("backend/src"), None);
-        assert_eq!(tree.found("."), None);
+        assert!(matches!(
+            tree.found("backend/src"),
+            Err(VersionerError::ManifestNotFound)
+        ));
     }
 
     #[test]
-    fn outside_a_repository_only_the_current_directory_counts() {
-        let tree = Tree::new(&["."]);
+    fn prefers_the_one_manifest_with_a_version() {
+        let tree = Tree::new(&[
+            ("package.json", r#"{"private": true}"#),
+            ("Cargo.toml", CARGO),
+        ]);
 
-        assert_eq!(locate(&tree.at("."), None), Some(tree.at("package.json")));
-        assert_eq!(locate(&tree.at("backend/src"), None), None);
+        assert_eq!(tree.found(".").unwrap(), "Cargo.toml");
+    }
+
+    #[test]
+    fn refuses_to_guess_between_versioned_manifests() {
+        let tree = Tree::new(&[("package.json", NPM), ("Cargo.toml", CARGO)]);
+
+        let Err(VersionerError::AmbiguousManifest(labels)) = tree.found(".") else {
+            panic!("expected an ambiguity error");
+        };
+
+        assert_eq!(labels, ["package.json", "Cargo.toml"]);
+    }
+
+    #[test]
+    fn reports_the_most_useful_failure() {
+        let inherited = "[package]\nname = \"a\"\nversion.workspace = true\n";
+        let tree = Tree::new(&[("package.json", "{}"), ("Cargo.toml", inherited)]);
+
+        assert!(matches!(
+            tree.found("."),
+            Err(VersionerError::UnsupportedVersion(..))
+        ));
     }
 
     #[test]
     fn scopes_a_tag_by_the_unscoped_package_name() {
         let path = Path::new("/repo/backend/package.json");
 
-        assert_eq!(
-            tag_scope(&json!({"name": "@airisk/backend"}), path),
-            "backend"
-        );
-        assert_eq!(tag_scope(&json!({"name": "backend"}), path), "backend");
+        assert_eq!(tag_scope(Some("@airisk/backend"), path), "backend");
+        assert_eq!(tag_scope(Some("backend"), path), "backend");
     }
 
     #[test]
     fn falls_back_to_the_directory_without_a_usable_name() {
         let path = Path::new("/repo/backend/package.json");
 
-        assert_eq!(tag_scope(&json!({}), path), "backend");
-        assert_eq!(tag_scope(&json!({"name": "@scope/"}), path), "backend");
-        assert_eq!(tag_scope(&json!({"name": 3}), path), "backend");
+        assert_eq!(tag_scope(None, path), "backend");
+        assert_eq!(tag_scope(Some("@scope/"), path), "backend");
     }
 
     #[test]
@@ -423,71 +327,5 @@ mod tests {
         assert_eq!(slugify("--lead.."), "lead");
         assert_eq!(slugify("cache.lock"), "cache");
         assert_eq!(slugify("..."), "");
-    }
-
-    fn version_of(source: &str) -> Option<&str> {
-        version_span(source).map(|span| &source[span])
-    }
-
-    #[test]
-    fn finds_the_top_level_version() {
-        assert_eq!(version_of(r#"{"version": "1.2.3"}"#), Some("1.2.3"));
-        assert_eq!(
-            version_of("{\n\t\"version\": \"1.2.3\"\n}\n"),
-            Some("1.2.3")
-        );
-    }
-
-    #[test]
-    fn ignores_a_nested_version() {
-        let source = r#"{"engines": {"version": "nested"}, "version": "1.2.3"}"#;
-
-        assert_eq!(version_of(source), Some("1.2.3"));
-    }
-
-    #[test]
-    fn ignores_version_used_as_a_value() {
-        let source = r#"{"type": "version", "version": "1.2.3"}"#;
-
-        assert_eq!(version_of(source), Some("1.2.3"));
-    }
-
-    #[test]
-    fn ignores_version_inside_an_array() {
-        let source = r#"{"keywords": ["version"], "version": "1.2.3"}"#;
-
-        assert_eq!(version_of(source), Some("1.2.3"));
-    }
-
-    #[test]
-    fn tolerates_whitespace_around_the_colon() {
-        assert_eq!(version_of("{\"version\"\n  :\t\"1.2.3\"}"), Some("1.2.3"));
-    }
-
-    #[test]
-    fn skips_escaped_quotes_and_multibyte_text() {
-        let source = r#"{"description": "héllo \"version\": ✓", "version": "1.2.3"}"#;
-
-        assert_eq!(version_of(source), Some("1.2.3"));
-    }
-
-    #[test]
-    fn spans_only_the_value() {
-        let source = r#"{"version": "1.2.3"}"#;
-        let span = version_span(source).unwrap();
-
-        assert_eq!(&source[span.start - 1..span.end + 1], r#""1.2.3""#);
-    }
-
-    #[test]
-    fn finds_nothing_without_a_top_level_version() {
-        assert_eq!(version_of(r#"{"name": "demo"}"#), None);
-        assert_eq!(version_of(r#"{"a": {"version": "1.2.3"}}"#), None);
-    }
-
-    #[test]
-    fn finds_nothing_when_the_version_is_not_a_string() {
-        assert_eq!(version_of(r#"{"version": 3}"#), None);
-        assert_eq!(version_of(r#"{"version": null}"#), None);
     }
 }
